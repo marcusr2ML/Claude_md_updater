@@ -1,0 +1,108 @@
+name: Replay install from log
+
+on:
+  workflow_dispatch:
+    inputs:
+      log:
+        description: Path to the log, e.g. logs/incoming/run-001.log
+        required: true
+  push:
+    paths: ['logs/incoming/**']
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # ---------------------------------------------------------------- 1. parse
+  fingerprint:
+    runs-on: ubuntu-latest
+    outputs:
+      runs_on:   ${{ steps.fp.outputs.runs_on }}
+      container: ${{ steps.fp.outputs.container }}
+      exact:     ${{ steps.fp.outputs.exact }}
+      log:       ${{ steps.fp.outputs.log }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: fp
+        run: |
+          LOG="${{ inputs.log }}"
+          [ -n "$LOG" ] || LOG=$(ls -t logs/incoming/* | head -1)
+          python3 scripts/parse_log.py "$LOG" > fingerprint.json
+          cat fingerprint.json
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          f = json.load(open("fingerprint.json"))
+          print(f"runs_on={f['runs_on']}")
+          print(f"container={f['container'] or ''}")
+          print(f"exact={str(f['exact']).lower()}")
+          print("log=" + os.environ["LOG"])
+          PY
+        env:
+          LOG: ${{ inputs.log }}
+
+      - uses: actions/upload-artifact@v4
+        with: { name: fingerprint, path: fingerprint.json }
+
+  # --------------------------------------------------------------- 2. replay
+  replay:
+    needs: fingerprint
+    runs-on: ${{ needs.fingerprint.outputs.runs_on }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: fingerprint }
+
+      # Linux: the install runs inside the matching image as a NON-ROOT user.
+      # The whole point of the doc is the no-root path; a root container would
+      # test a branch nobody uses.
+      - name: Start target container
+        if: needs.fingerprint.outputs.container != ''
+        run: |
+          docker run -d --name alps-target -w /home/tester \
+            -v "$PWD:/repo:ro" ${{ needs.fingerprint.outputs.container }} sleep infinity
+          docker exec alps-target sh -c '
+            (command -v dnf && dnf -y install shadow-utils procps-ng which tar curl) ||
+            (apt-get update && apt-get -y install passwd procps curl tar)
+            useradd -m tester'
+          echo 'ALPS_EXEC=docker exec -u tester -w /home/tester alps-target bash -lc' >> $GITHUB_ENV
+
+      - name: No container (macOS runs directly)
+        if: needs.fingerprint.outputs.container == ''
+        run: echo 'ALPS_EXEC=bash -lc' >> $GITHUB_ENV
+
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+
+      - run: npm install -g @anthropic-ai/claude-code
+
+      - name: Replay
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          EXACT: ${{ needs.fingerprint.outputs.exact }}
+          ORIGINAL_LOG: ${{ needs.fingerprint.outputs.log }}
+        run: |
+          claude -p "$(cat REPLAY.md)" \
+            --allowedTools "Read,Edit,Write,Bash" \
+            --max-turns 150 \
+            2>&1 | tee replay-transcript.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: replay-output
+          path: |
+            replay-transcript.txt
+            findings.md
+            replay.log
+
+      - name: Open PR if the doc was edited
+        if: always()
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: replay/${{ github.run_id }}
+          title: "Replay findings: ${{ needs.fingerprint.outputs.container || needs.fingerprint.outputs.runs_on }}"
+          body-path: findings.md
+          add-paths: alps-install-agent.md
